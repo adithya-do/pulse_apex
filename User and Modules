@@ -1,0 +1,32 @@
+insert into app_roles(code,name) values ('ADMIN','Administrator');
+insert into app_roles(code,name) values ('SUPER','Super User');
+insert into app_roles(code,name) values ('ORACLE','Oracle Module User');
+insert into app_roles(code,name) values ('MSSQL','SQL Server Module User');
+
+insert into app_modules(code,name) values ('ORA_DB','Oracle Databases');
+insert into app_modules(code,name) values ('MSSQL_DB','SQL Server Databases');
+commit;
+
+-- Create initial app user (not the workspace admin; this is your app login)
+declare v_temp varchar2(32);
+begin
+  auth_pkg.create_user(p_login=>'admin', p_full=>'Platform Admin',
+                       p_email=>'admin@yourcompany.com', p_temp_password=>v_temp);
+  dbms_output.put_line('Admin temp password = '||v_temp);
+end;
+/
+
+insert into app_user_roles(user_id, role_id)
+select u.user_id, r.role_id
+from app_users u join app_roles r on r.code in ('ADMIN','SUPER')
+where u.login_name='admin';
+
+insert into app_user_modules(user_id, module_id)
+select u.user_id, m.module_id
+from app_users u join app_modules m on m.code in ('ORA_DB','MSSQL_DB')
+where u.login_name='admin';
+commit;
+
+-- If you didn't capture DBMS_OUTPUT, send a temp password email:
+begin auth_pkg.forgot_password('admin'); end;
+/
