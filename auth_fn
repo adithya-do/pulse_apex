@@ -12,3 +12,22 @@ begin
   end if;
 end;
 /
+
+
+
+exists (
+  select 1
+    from app_user_roles r
+    join app_roles a on a.role_id = r.role_id
+   where r.user_id = :APP_USER_ID
+     and a.code = 'ADMIN'
+)
+
+
+exists (
+  select 1
+    from app_user_modules um
+    join app_modules m on m.module_id = um.module_id
+   where um.user_id = :APP_USER_ID
+     and m.code = 'ORA_DB'
+)
