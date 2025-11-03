@@ -1,21 +1,34 @@
 CREATE OR REPLACE PACKAGE encrypt_pkg AUTHID DEFINER AS
+  -- Returns a salted, iterated SHA-512 hash of p_plain; also outputs the random salt.
   FUNCTION hash_password(p_plain IN VARCHAR2, p_salt OUT RAW) RETURN RAW;
-  FUNCTION verify_password(p_plain IN VARCHAR2, p_salt IN RAW, p_hash IN RAW) RETURN NUMBER; -- 1 match / 0 no
+
+  -- Verifies p_plain against stored salt+hash (returns 1 = match, 0 = no match).
+  FUNCTION verify_password(p_plain IN VARCHAR2, p_salt IN RAW, p_hash IN RAW) RETURN NUMBER;
+
+  -- Encrypts a secret (e.g., DB password) with AES-256-CBC; returns IV||CIPHERTEXT (RAW).
   FUNCTION enc_secret(p_plain IN VARCHAR2) RETURN RAW;
-  FUNCTION dec_secret(p_raw   IN RAW) RETURN VARCHAR2;
+
+  -- Decrypts value produced by enc_secret (expects IV||CIPHERTEXT).
+  FUNCTION dec_secret(p_raw IN RAW) RETURN VARCHAR2;
 END encrypt_pkg;
 /
+SHOW ERRORS;
 
 CREATE OR REPLACE PACKAGE BODY encrypt_pkg AS
-  -- 32-byte AES-256 key. Generate your own and keep this package BODY tightly locked down.
+  -------------------------------------------------------------------------
+  --  SECURITY NOTES
+  --  * g_key MUST be replaced with your own 32-byte key (keep body locked).
+  --  * Rotate keys via a maintenance routine (decrypt-re-encrypt).
+  -------------------------------------------------------------------------
   g_key  RAW(32) := HEXTORAW('7B1D0F8C6A55A4E91F3B2C4D5E6F70811223344556677889900AABBCCDDEEFF0');
-  g_iter CONSTANT PLS_INTEGER := 20000;
+  g_iter CONSTANT PLS_INTEGER := 20000;  -- CPU-friendly iteration count
 
+  -- Simple PBKDF using repeated SHA-512 over (data || salt)
   FUNCTION pbkdf_sha512(p_data RAW, p_salt RAW, p_iter PLS_INTEGER) RETURN RAW IS
     l_hash RAW(64);
   BEGIN
     l_hash := DBMS_CRYPTO.HASH(p_data || p_salt, DBMS_CRYPTO.HASH_SH512);
-    FOR i IN 1..p_iter LOOP
+    FOR i IN 1 .. p_iter LOOP
       l_hash := DBMS_CRYPTO.HASH(l_hash || p_salt, DBMS_CRYPTO.HASH_SH512);
     END LOOP;
     RETURN l_hash;
@@ -35,17 +48,15 @@ CREATE OR REPLACE PACKAGE BODY encrypt_pkg AS
   END;
 
   FUNCTION enc_secret(p_plain IN VARCHAR2) RETURN RAW IS
-    l_iv  RAW(16) := DBMS_CRYPTO.RANDOMBYTES(16);
-    l_ct  RAW(32767);
+    l_iv RAW(16) := DBMS_CRYPTO.RANDOMBYTES(16);
+    l_ct RAW(32767);
   BEGIN
     l_ct := DBMS_CRYPTO.ENCRYPT(
               src => UTL_RAW.CAST_TO_RAW(p_plain),
-              typ => DBMS_CRYPTO.ENCRYPT_AES256
-                   + DBMS_CRYPTO.CHAIN_CBC
-                   + DBMS_CRYPTO.PAD_PKCS5,
+              typ => DBMS_CRYPTO.ENCRYPT_AES256 + DBMS_CRYPTO.CHAIN_CBC + DBMS_CRYPTO.PAD_PKCS5,
               key => g_key,
               iv  => l_iv);
-    RETURN l_iv || l_ct;  -- store IV || ciphertext
+    RETURN l_iv || l_ct;  -- store IV + ciphertext together
   END;
 
   FUNCTION dec_secret(p_raw IN RAW) RETURN VARCHAR2 IS
@@ -57,96 +68,127 @@ CREATE OR REPLACE PACKAGE BODY encrypt_pkg AS
     l_ct := UTL_RAW.SUBSTR(p_raw, 17);
     l_pt := DBMS_CRYPTO.DECRYPT(
               src => l_ct,
-              typ => DBMS_CRYPTO.ENCRYPT_AES256
-                   + DBMS_CRYPTO.CHAIN_CBC
-                   + DBMS_CRYPTO.PAD_PKCS5,
+              typ => DBMS_CRYPTO.ENCRYPT_AES256 + DBMS_CRYPTO.CHAIN_CBC + DBMS_CRYPTO.PAD_PKCS5,
               key => g_key,
               iv  => l_iv);
     RETURN UTL_RAW.CAST_TO_VARCHAR2(l_pt);
   END;
 END encrypt_pkg;
 /
+SHOW ERRORS;
 
 
-create or replace package auth_pkg authid definer as
-  function login(p_login in varchar2, p_password in varchar2) return number; -- returns user_id or null
-  procedure set_password(p_user_id in number, p_new in varchar2);
-  procedure create_user(p_login in varchar2, p_full in varchar2, p_email in varchar2,
-                        p_temp_password out varchar2);
-  procedure forgot_password(p_login in varchar2); -- emails a one-time temp password
-end auth_pkg;
+
+
+
+
+CREATE OR REPLACE PACKAGE auth_pkg AUTHID DEFINER AS
+  -- Returns user_id on success, NULL on failure.
+  FUNCTION login(p_login IN VARCHAR2, p_password IN VARCHAR2) RETURN NUMBER;
+
+  -- Set a new password for an existing user_id (clears must_change_pwd).
+  PROCEDURE set_password(p_user_id IN NUMBER, p_new IN VARCHAR2);
+
+  -- Creates a user with a random temp password (returned in OUT param).
+  PROCEDURE create_user(
+    p_login         IN  VARCHAR2,
+    p_full          IN  VARCHAR2,
+    p_email         IN  VARCHAR2,
+    p_temp_password OUT VARCHAR2
+  );
+
+  -- Generates a temp password for p_login and emails it to the user.
+  PROCEDURE forgot_password(p_login IN VARCHAR2);
+END auth_pkg;
 /
+SHOW ERRORS;
 
-create or replace package body auth_pkg as
-  function login(p_login in varchar2, p_password in varchar2) return number is
-    l_uid app_users.user_id%type;
-    l_hash raw(2000);
-    l_salt raw(2000);
-    l_active char(1);
-  begin
-    select user_id, pwd_hash, pwd_salt, is_active
-      into l_uid, l_hash, l_salt, l_active
-      from app_users where login_name = lower(p_login);
-    if l_active <> 'Y' then return null; end if;
-    if encrypt_pkg.verify_password(p_password, l_salt, l_hash)=1 then
-      return l_uid;
-    else
-      return null;
-    end if;
-  exception when no_data_found then
-    return null;
-  end;
+CREATE OR REPLACE PACKAGE BODY auth_pkg AS
+  FUNCTION login(p_login IN VARCHAR2, p_password IN VARCHAR2) RETURN NUMBER IS
+    l_uid   app_users.user_id%TYPE;
+    l_hash  app_users.pwd_hash%TYPE;
+    l_salt  app_users.pwd_salt%TYPE;
+    l_active app_users.is_active%TYPE;
+  BEGIN
+    SELECT user_id, pwd_hash, pwd_salt, is_active
+      INTO l_uid,   l_hash,   l_salt,   l_active
+      FROM app_users
+     WHERE login_name = LOWER(p_login);
 
-  procedure set_password(p_user_id in number, p_new in varchar2) is
-    l_salt raw(2000);
-    l_hash raw(2000);
-  begin
+    IF l_active <> 'Y' THEN
+      RETURN NULL;
+    END IF;
+
+    IF encrypt_pkg.verify_password(p_password, l_salt, l_hash) = 1 THEN
+      RETURN l_uid;
+    ELSE
+      RETURN NULL;
+    END IF;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      RETURN NULL;
+  END;
+
+  PROCEDURE set_password(p_user_id IN NUMBER, p_new IN VARCHAR2) IS
+    l_salt RAW(2000);
+    l_hash RAW(2000);
+  BEGIN
     l_hash := encrypt_pkg.hash_password(p_new, l_salt);
-    update app_users
-       set pwd_hash = l_hash, pwd_salt = l_salt,
-           must_change_pwd = 'N', updated_at = systimestamp
-     where user_id = p_user_id;
-  end;
+    UPDATE app_users
+       SET pwd_hash       = l_hash,
+           pwd_salt       = l_salt,
+           must_change_pwd= 'N',
+           updated_at     = SYSTIMESTAMP
+     WHERE user_id        = p_user_id;
+  END;
 
-  procedure create_user(p_login in varchar2, p_full in varchar2, p_email in varchar2,
-                        p_temp_password out varchar2) is
-    l_salt raw(2000); l_hash raw(2000);
-  begin
-    p_temp_password := substr(standard_hash(sys_guid()||systimestamp,'SHA512'),1,16);
+  PROCEDURE create_user(
+    p_login         IN  VARCHAR2,
+    p_full          IN  VARCHAR2,
+    p_email         IN  VARCHAR2,
+    p_temp_password OUT VARCHAR2
+  ) IS
+    l_salt RAW(2000);
+    l_hash RAW(2000);
+  BEGIN
+    -- 16-char temp password (hex slice of SHA-256 over GUID+timestamp)
+    p_temp_password := SUBSTR(RAWTOHEX(STANDARD_HASH(SYS_GUID() || SYSTIMESTAMP, 'SHA256')), 1, 16);
+
     l_hash := encrypt_pkg.hash_password(p_temp_password, l_salt);
-    insert into app_users(login_name, full_name, email, pwd_hash, pwd_salt, is_active, must_change_pwd)
-      values (lower(p_login), p_full, p_email, l_hash, l_salt, 'Y', 'Y');
-  end;
 
-  procedure forgot_password(p_login in varchar2) is
-    l_uid number; l_email varchar2(320); l_temp varchar2(32);
-  begin
-    select user_id, email into l_uid, l_email from app_users where login_name=lower(p_login);
-    l_temp := substr(standard_hash(sys_guid()||systimestamp,'SHA512'),1,16);
+    INSERT INTO app_users (login_name, full_name, email, pwd_hash, pwd_salt, is_active, must_change_pwd, created_at)
+    VALUES (LOWER(p_login), p_full, p_email, l_hash, l_salt, 'Y', 'Y', SYSTIMESTAMP);
+  END;
+
+  PROCEDURE forgot_password(p_login IN VARCHAR2) IS
+    l_uid   app_users.user_id%TYPE;
+    l_email app_users.email%TYPE;
+    l_temp  VARCHAR2(32);
+  BEGIN
+    SELECT user_id, email
+      INTO l_uid,  l_email
+      FROM app_users
+     WHERE login_name = LOWER(p_login);
+
+    -- Generate and set a new temp password
+    l_temp := SUBSTR(RAWTOHEX(STANDARD_HASH(SYS_GUID() || SYSTIMESTAMP, 'SHA256')), 1, 16);
     set_password(l_uid, l_temp);
-    -- Use APEX_MAIL (configure SMTP in Instance Settings / APEX_MAIL)
-    apex_mail.send(
-      p_to => l_email,
+
+    -- Send email (requires APEX mail config + ACL)
+    APEX_MAIL.SEND(
+      p_to   => l_email,
       p_from => 'no-reply@yourdomain',
       p_subj => 'Your temporary password',
-      p_body => 'Hi, your temporary password is: '||l_temp||chr(10)||
-                'Please log in and change it immediately.');
-  exception when no_data_found then null;
-  end;
-end auth_pkg;
-/
+      p_body => 'Hello,' || CHR(10) ||
+                'Your temporary password is: ' || l_temp || CHR(10) ||
+                'Please log in and change it immediately.'
+    );
+    COMMIT;  -- enqueue mail
 
-
-create or replace package health_pkg authid definer as
-  procedure enqueue_check(p_module_code in varchar2, p_target_id in number, p_user_id in number);
-end health_pkg;
+  EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+      NULL;  -- Do not reveal whether a login exists
+  END;
+END auth_pkg;
 /
-
-create or replace package body health_pkg as
-  procedure enqueue_check(p_module_code in varchar2, p_target_id in number, p_user_id in number) is
-  begin
-    insert into job_queue(module_code, target_id, job_type, requested_by)
-      values (p_module_code, p_target_id, 'CHECK', p_user_id);
-  end;
-end health_pkg;
-/
+SHOW ERRORS;
