@@ -1,0 +1,14 @@
+create or replace function apex_auth_fn(p_username in varchar2, p_password in varchar2)
+  return boolean
+is
+  l_uid number;
+begin
+  l_uid := auth_pkg.login(p_login => p_username, p_password => p_password);
+  if l_uid is not null then
+    apex_util.set_session_state('APP_USER_ID', l_uid);
+    return true;
+  else
+    return false;
+  end if;
+end;
+/
