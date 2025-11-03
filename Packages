@@ -1,29 +1,19 @@
 CREATE OR REPLACE PACKAGE encrypt_pkg AUTHID DEFINER AS
-  -- Returns a salted, iterated SHA-512 hash of p_plain; also outputs the random salt.
   FUNCTION hash_password(p_plain IN VARCHAR2, p_salt OUT RAW) RETURN RAW;
-
-  -- Verifies p_plain against stored salt+hash (returns 1 = match, 0 = no match).
-  FUNCTION verify_password(p_plain IN VARCHAR2, p_salt IN RAW, p_hash IN RAW) RETURN NUMBER;
-
-  -- Encrypts a secret (e.g., DB password) with AES-256-CBC; returns IV||CIPHERTEXT (RAW).
-  FUNCTION enc_secret(p_plain IN VARCHAR2) RETURN RAW;
-
-  -- Decrypts value produced by enc_secret (expects IV||CIPHERTEXT).
-  FUNCTION dec_secret(p_raw IN RAW) RETURN VARCHAR2;
+  FUNCTION verify_password(p_plain IN VARCHAR2, p_salt IN RAW, p_hash IN RAW) RETURN NUMBER; -- 1 match / 0 no
+  FUNCTION enc_secret(p_plain IN VARCHAR2) RETURN RAW;   -- returns IV||CIPHERTEXT
+  FUNCTION dec_secret(p_raw   IN RAW) RETURN VARCHAR2;   -- expects IV||CIPHERTEXT
 END encrypt_pkg;
 /
 SHOW ERRORS;
 
 CREATE OR REPLACE PACKAGE BODY encrypt_pkg AS
   -------------------------------------------------------------------------
-  --  SECURITY NOTES
-  --  * g_key MUST be replaced with your own 32-byte key (keep body locked).
-  --  * Rotate keys via a maintenance routine (decrypt-re-encrypt).
+  -- Replace this with your own 32-byte key and keep the BODY locked down.
   -------------------------------------------------------------------------
   g_key  RAW(32) := HEXTORAW('7B1D0F8C6A55A4E91F3B2C4D5E6F70811223344556677889900AABBCCDDEEFF0');
-  g_iter CONSTANT PLS_INTEGER := 20000;  -- CPU-friendly iteration count
+  g_iter CONSTANT PLS_INTEGER := 20000;
 
-  -- Simple PBKDF using repeated SHA-512 over (data || salt)
   FUNCTION pbkdf_sha512(p_data RAW, p_salt RAW, p_iter PLS_INTEGER) RETURN RAW IS
     l_hash RAW(64);
   BEGIN
@@ -56,7 +46,7 @@ CREATE OR REPLACE PACKAGE BODY encrypt_pkg AS
               typ => DBMS_CRYPTO.ENCRYPT_AES256 + DBMS_CRYPTO.CHAIN_CBC + DBMS_CRYPTO.PAD_PKCS5,
               key => g_key,
               iv  => l_iv);
-    RETURN l_iv || l_ct;  -- store IV + ciphertext together
+    RETURN l_iv || l_ct;
   END;
 
   FUNCTION dec_secret(p_raw IN RAW) RETURN VARCHAR2 IS
@@ -78,36 +68,29 @@ END encrypt_pkg;
 SHOW ERRORS;
 
 
-
-
-
-
 CREATE OR REPLACE PACKAGE auth_pkg AUTHID DEFINER AS
-  -- Returns user_id on success, NULL on failure.
-  FUNCTION login(p_login IN VARCHAR2, p_password IN VARCHAR2) RETURN NUMBER;
-
-  -- Set a new password for an existing user_id (clears must_change_pwd).
+  FUNCTION login(p_login IN VARCHAR2, p_password IN VARCHAR2) RETURN NUMBER;  -- user_id or NULL
   PROCEDURE set_password(p_user_id IN NUMBER, p_new IN VARCHAR2);
-
-  -- Creates a user with a random temp password (returned in OUT param).
-  PROCEDURE create_user(
-    p_login         IN  VARCHAR2,
-    p_full          IN  VARCHAR2,
-    p_email         IN  VARCHAR2,
-    p_temp_password OUT VARCHAR2
-  );
-
-  -- Generates a temp password for p_login and emails it to the user.
+  PROCEDURE create_user(p_login IN VARCHAR2, p_full IN VARCHAR2, p_email IN VARCHAR2,
+                        p_temp_password OUT VARCHAR2);
   PROCEDURE forgot_password(p_login IN VARCHAR2);
 END auth_pkg;
 /
 SHOW ERRORS;
 
 CREATE OR REPLACE PACKAGE BODY auth_pkg AS
+  -- Generate a hex password of length p_len using DBMS_CRYPTO only.
+  FUNCTION gen_temp_password(p_len PLS_INTEGER DEFAULT 16) RETURN VARCHAR2 IS
+    -- 32 hex chars come from 16 random bytes; take as many as needed.
+    l_hex VARCHAR2(4000) := LOWER(RAWTOHEX(DBMS_CRYPTO.RANDOMBYTES(32)));
+  BEGIN
+    RETURN SUBSTR(l_hex, 1, LEAST(p_len, LENGTH(l_hex)));
+  END;
+
   FUNCTION login(p_login IN VARCHAR2, p_password IN VARCHAR2) RETURN NUMBER IS
-    l_uid   app_users.user_id%TYPE;
-    l_hash  app_users.pwd_hash%TYPE;
-    l_salt  app_users.pwd_salt%TYPE;
+    l_uid    app_users.user_id%TYPE;
+    l_hash   app_users.pwd_hash%TYPE;
+    l_salt   app_users.pwd_salt%TYPE;
     l_active app_users.is_active%TYPE;
   BEGIN
     SELECT user_id, pwd_hash, pwd_salt, is_active
@@ -135,46 +118,40 @@ CREATE OR REPLACE PACKAGE BODY auth_pkg AS
   BEGIN
     l_hash := encrypt_pkg.hash_password(p_new, l_salt);
     UPDATE app_users
-       SET pwd_hash       = l_hash,
-           pwd_salt       = l_salt,
-           must_change_pwd= 'N',
-           updated_at     = SYSTIMESTAMP
-     WHERE user_id        = p_user_id;
+       SET pwd_hash        = l_hash,
+           pwd_salt        = l_salt,
+           must_change_pwd = 'N',
+           updated_at      = SYSTIMESTAMP
+     WHERE user_id         = p_user_id;
   END;
 
-  PROCEDURE create_user(
-    p_login         IN  VARCHAR2,
-    p_full          IN  VARCHAR2,
-    p_email         IN  VARCHAR2,
-    p_temp_password OUT VARCHAR2
-  ) IS
+  PROCEDURE create_user(p_login IN VARCHAR2, p_full IN VARCHAR2, p_email IN VARCHAR2,
+                        p_temp_password OUT VARCHAR2) IS
     l_salt RAW(2000);
     l_hash RAW(2000);
   BEGIN
-    -- 16-char temp password (hex slice of SHA-256 over GUID+timestamp)
-    p_temp_password := SUBSTR(RAWTOHEX(STANDARD_HASH(SYS_GUID() || SYSTIMESTAMP, 'SHA256')), 1, 16);
-
+    p_temp_password := gen_temp_password(16);
     l_hash := encrypt_pkg.hash_password(p_temp_password, l_salt);
 
-    INSERT INTO app_users (login_name, full_name, email, pwd_hash, pwd_salt, is_active, must_change_pwd, created_at)
+    INSERT INTO app_users (login_name, full_name, email, pwd_hash, pwd_salt,
+                           is_active, must_change_pwd, created_at)
     VALUES (LOWER(p_login), p_full, p_email, l_hash, l_salt, 'Y', 'Y', SYSTIMESTAMP);
   END;
 
   PROCEDURE forgot_password(p_login IN VARCHAR2) IS
     l_uid   app_users.user_id%TYPE;
     l_email app_users.email%TYPE;
-    l_temp  VARCHAR2(32);
+    l_temp  VARCHAR2(64);
   BEGIN
     SELECT user_id, email
       INTO l_uid,  l_email
       FROM app_users
      WHERE login_name = LOWER(p_login);
 
-    -- Generate and set a new temp password
-    l_temp := SUBSTR(RAWTOHEX(STANDARD_HASH(SYS_GUID() || SYSTIMESTAMP, 'SHA256')), 1, 16);
+    l_temp := gen_temp_password(16);
     set_password(l_uid, l_temp);
 
-    -- Send email (requires APEX mail config + ACL)
+    -- Email the temp password (APEX mail must be configured + ACL in place)
     APEX_MAIL.SEND(
       p_to   => l_email,
       p_from => 'no-reply@yourdomain',
@@ -183,12 +160,13 @@ CREATE OR REPLACE PACKAGE BODY auth_pkg AS
                 'Your temporary password is: ' || l_temp || CHR(10) ||
                 'Please log in and change it immediately.'
     );
-    COMMIT;  -- enqueue mail
+    COMMIT;  -- enqueue the mail
 
   EXCEPTION
     WHEN NO_DATA_FOUND THEN
-      NULL;  -- Do not reveal whether a login exists
+      NULL;  -- Don’t reveal whether the login exists
   END;
 END auth_pkg;
 /
 SHOW ERRORS;
+
