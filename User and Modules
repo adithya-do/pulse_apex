@@ -1,3 +1,18 @@
+(One-time) Email + Network ACL setup
+
+begin
+  dbms_network_acl_admin.append_host_ace(
+    host => 'smtp.yourcompany.com', lower_port => 25, upper_port => 25,
+    ace  => xs$ace_type(xs$ace_type.principal_type_db, 'PULSEAPP', 'connect', null));
+end;
+/
+
+grant execute on apex_crypto to PULSEAPP;
+grant execute on apex_mail   to PULSEAPP;
+
+
+
+
 insert into app_roles(code,name) values ('ADMIN','Administrator');
 insert into app_roles(code,name) values ('SUPER','Super User');
 insert into app_roles(code,name) values ('ORACLE','Oracle Module User');
