@@ -1,12 +1,19 @@
 (One-time) Email + Network ACL setup
 
-begin
-  dbms_network_acl_admin.append_host_ace(
-    host => 'smtp.yourcompany.com', lower_port => 25, upper_port => 25,
-    ace  => xs$ace_type(xs$ace_type.principal_type_db, 'PULSEAPP', 'connect', null));
-end;
+BEGIN
+  DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+    host        => 'smtp.yourcompany.com',
+    lower_port  => 25,          -- or 587, 465 etc
+    upper_port  => 25,
+    ace         => XS$ACE_TYPE(
+                     privilege_list => XS$NAME_LIST('connect'),   -- optionally add 'resolve'
+                     principal_name => 'PULSEAPP',
+                     principal_type => XS_ACL.PTYPE_DB
+                   )
+  );
+END;
 /
-
+COMMIT;
 grant execute on apex_crypto to PULSEAPP;
 grant execute on apex_mail   to PULSEAPP;
 
